@@ -13,9 +13,7 @@ writing, software distributed under the License is distributed on an "AS
 IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
 or implied.
 
-
-
-  import os
+import os
 import json
 import re
 import logging
@@ -31,28 +29,23 @@ app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("myapp")
 
-# ---------------------------
-# Configurable Parameters
-# ---------------------------
-APIC_URL = os.environ.get("APIC_URL", "https://your-apic-url")
+# ---- Configurable Parameters (set as environment variables or config files) ----
+APIC_URL = os.environ.get("APIC_URL", "https://apic.example.com")
 APIC_USER = os.environ.get("APIC_USER", "your_apic_user")
 APIC_PASS = os.environ.get("APIC_PASS", "your_apic_password")
 
-CSW_API_URL = os.environ.get("CSW_API_URL", "https://your-csw-url")
+CSW_API_URL = os.environ.get("CSW_API_URL", "https://csw.example.com")
 CSW_CRED_FILE = os.environ.get("CSW_CRED_FILE", "./credentials.json")
+WORKLOAD_ID = os.environ.get("WORKLOAD_ID", "YOUR_WORKLOAD_ID")
+
+FW_API_URL = os.environ.get("FW_API_URL", "http://fw.example.com:9000")
 FW_USER = os.environ.get("FW_USER", "your_fw_user")
 FW_PASS = os.environ.get("FW_PASS", "your_fw_password")
-FW_API_URL = os.environ.get("FW_API_URL", "http://your-fw-url:9000")
+FIREWALL_SOURCE = os.environ.get("FIREWALL_SOURCE", "your_firewall_source")
 
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434")
 OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "qwq:32b")
 
-FIREWALL_SOURCE = os.environ.get("FIREWALL_SOURCE", "FIREWALL_SOURCE_PLACEHOLDER")
-WORKLOAD_ID = os.environ.get("WORKLOAD_ID", "WORKLOAD_ID_PLACEHOLDER")
-
-# ---------------------------
-# Functions
-# ---------------------------
 
 def gatherdata(ip):
     """Retrieve endpoint, tracker, and switch info from Cisco APIC."""
@@ -62,14 +55,15 @@ def gatherdata(ip):
 
     try:
         with requests.Session() as session:
-            auth_response = session.post(auth_endpoint, json=login_payload, verify=False)
+            auth_response = session.post(auth_endpoint, json=login_payload, verify=False)  # Consider setting verify=True for production!
             if auth_response.status_code != 200:
                 logger.error(f"APIC authentication failed: {auth_response.status_code}")
                 return epinfo, trackerinfo, switchinfo
 
-            event_url = (f'{APIC_URL}/api/node/class/fvCEp.json?'
-                         f'rsp-subtree=full&rsp-subtree-include=required&'
-                         f'rsp-subtree-filter=eq(fvIp.addr,"%s")' % ip)
+            event_url = (
+                f'{APIC_URL}/api/node/class/fvCEp.json?rsp-subtree=full&rsp-subtree-include=required&'
+                f'rsp-subtree-filter=eq(fvIp.addr,"%s")' % ip
+            )
             ep_response = session.get(event_url, verify=False)
             if ep_response.status_code != 200:
                 logger.warning(f"Failed to get endpoint info: {ep_response.status_code}")
@@ -83,6 +77,9 @@ def gatherdata(ip):
             ep_attr = epinfo["imdata"][0]["fvCEp"]["attributes"]
             ep_dn = ep_attr.get("dn")
             fabric_path = ep_attr.get("fabricPathDn", "").split("/")
+            if len(fabric_path) < 3:
+                logger.warning("Fabric path info incomplete")
+                return epinfo, trackerinfo, switchinfo
             path = f"{fabric_path[0]}/{fabric_path[1]}/{fabric_path[2].replace('paths','node')}"
 
             tracker_url = f"{APIC_URL}/mqapi2/troubleshoot.eptracker.json?ep={ep_dn}&page=0&page-size=15"
@@ -101,13 +98,13 @@ def gatherdata(ip):
 
     return epinfo, trackerinfo, switchinfo
 
+
 def getSecData(ip):
     """Get Secure Workload vulnerabilities and firewall logs for an IP."""
     filtered, extra = [], []
 
     try:
         restclient = RestClient(CSW_API_URL, credentials_file=CSW_CRED_FILE, verify=False)
-        # Workload ID is now from config/env, not hardcoded
         resp = restclient.get(f'/workload/{WORKLOAD_ID}/vulnerabilities')
         if resp.text:
             try:
@@ -123,14 +120,33 @@ def getSecData(ip):
             'X-Requested-By': 'Nodered',
             'Accept': 'application/json'
         }
-        # Firewall source is from config/env, not hardcoded (e.g. dc1ftd03 removed)
         fw_query = {
             "queries": [{
                 "timerange": {"from": 300, "type": "relative"},
-                "query": {"type": "elasticsearch", "query_string": f"source:{FIREWALL_SOURCE} AND {ip}"},
+                "query": {
+                    "type": "elasticsearch",
+                    "query_string": f"source:{FIREWALL_SOURCE} AND {ip}"
+                },
                 "search_types": [
-                    {"type": "messages", "name": "rows", "limit": 150, "offset": 0, "sort": [{"field": "timestamp", "order": "DESC"}]},
-                    {"type": "pivot", "name": "chart", "series": [{"type": "count", "id": "count()", "field": None}], "row_groups": [{"type": "time", "fields": ["timestamp"], "interval": {"type": "auto", "scaling": 1.0}}], "sort": [], "rollup": True}
+                    {
+                        "type": "messages",
+                        "name": "rows",
+                        "limit": 150,
+                        "offset": 0,
+                        "sort": [{"field": "timestamp", "order": "DESC"}]
+                    },
+                    {
+                        "type": "pivot",
+                        "name": "chart",
+                        "series": [{"type": "count", "id": "count()", "field": None}],
+                        "row_groups": [{
+                            "type": "time",
+                            "fields": ["timestamp"],
+                            "interval": {"type": "auto", "scaling": 1.0}
+                        }],
+                        "sort": [],
+                        "rollup": True
+                    }
                 ]
             }],
             "parameters": []
@@ -158,13 +174,94 @@ def getSecData(ip):
 
     return filtered, extra
 
-# --- Rest of the functions unchanged ---
 
-# ... (run_after_response, sec_response, incoming)
+def run_after_response(data):
+    """Background: ACI data retrieval, LLM analysis, and ticket update."""
+    try:
+        zm = zmhandler.Zammad()
+        zm.updateTicket(data["ticket"]["id"], "In bearbeitung")
 
-# Example on how to set these ENV variables:
-# export APIC_URL="https://apic.example.com"
-# export FIREWALL_SOURCE="your_firewall_source"
-# export WORKLOAD_ID="your_workload_id"
-# (And so on...)
+        epinfo, trackerinfo, switchinfo = gatherdata(data["article"]["body"])
+        if not epinfo or not trackerinfo or not switchinfo:
+            logger.warning("Incomplete ACI data")
+            return
+
+        combined_input = (
+            f"Endpoint Information:\n{json.dumps(epinfo, indent=4)}\n\n"
+            f"Tracker Information:\n{json.dumps(trackerinfo, indent=4)}\n\n"
+            f"Switch Information:\n{json.dumps(switchinfo, indent=4)}"
+        )
+
+        model = OllamaLLM(
+            base_url=OLLAMA_URL,
+            model=OLLAMA_MODEL,
+            num_ctx=32000
+        )
+        question = (
+            f"Analyze and provide detailed insights based on the following ACI data:\n{combined_input}\n\n"
+            "Please structure your response with clear sections and bullet points, focusing on:\n"
+            "- Key findings from endpoint information\n"
+            "- Notable events from tracker information\n"
+            "- Significant issues in switch information\n"
+        )
+        result = model.invoke(question)
+        final_answer = re.sub(r"<think>.*?</think>", "", result, flags=re.DOTALL).strip()
+        zm.updateTicket(data["ticket"]["id"], final_answer)
+    except Exception as e:
+        logger.exception(f"Error in run_after_response: {e}")
+
+
+def sec_response(data):
+    """Background: Security workload data retrieval, LLM analysis, and ticket update."""
+    try:
+        zm = zmhandler.Zammad()
+        cswdata, fwlogs = getSecData(data["article"]["body"])
+        combined_input = (
+            f"CVS Information:\n{json.dumps(cswdata, indent=4)}\n\n"
+            f"Firewall Logs Information:\n{json.dumps(fwlogs, indent=4)}\n\n"
+        )
+        model = OllamaLLM(
+            base_url=OLLAMA_URL,
+            model=OLLAMA_MODEL,
+            num_ctx=32000
+        )
+        question = (
+            "You are a senior security analyst working in a SOC.\n"
+            "You receive two sets of data:\n"
+            "Firewall logs for a VM\n"
+            "Vulnerability data from Cisco Secure Workload for that same VM\n"
+            "Write a human-style, natural-language analysis for a security incident or vulnerability management ticket. "
+            "The output should be professional and concise. Include overview, correlations, risks, remediation, severity, and optional next steps.\n"
+            f"Format as SOC ticket note (no bullet points or tables, just natural text):\n{combined_input}\n"
+        )
+        result = model.invoke(question)
+        final_answer = re.sub(r"<think>.*?</think>", "", result, flags=re.DOTALL).strip()
+        zm.updateTicket(data["ticket"]["id"], final_answer)
+    except Exception as e:
+        logger.exception(f"Error in sec_response: {e}")
+
+
+@app.route('/incoming', methods=['POST'])
+def incoming():
+    """Main webhook endpoint for ticket events."""
+    try:
+        data = request.get_json(force=True)
+        ticket_id = data.get("ticket", {}).get("id")
+        body = data.get("article", {}).get("body")
+        logger.info(f"Received event for ticket {ticket_id}, body: {body}")
+
+        # Kick off background processing threads
+        threading.Thread(target=run_after_response, args=(data,), daemon=True).start()
+        threading.Thread(target=sec_response, args=(data,), daemon=True).start()
+
+        return jsonify({"status": "received"}), 200
+    except Exception as e:
+        logger.exception("Error in /incoming endpoint")
+        return jsonify({"error": "Internal server error"}), 500
+
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=5050, debug=False)
+
+
 
